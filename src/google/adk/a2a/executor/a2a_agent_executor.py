@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from datetime import timezone
 import inspect
@@ -87,9 +88,16 @@ class A2aAgentExecutor(AgentExecutor):
     super().__init__()
     self._runner = runner
     self._config = config or A2aAgentExecutorConfig()
+    # Track active tasks by task_id for cancellation support
+    self._active_tasks: dict[str, asyncio.Task] = {}
+    # Lock to protect _active_tasks from race conditions
+    self._tasks_lock = asyncio.Lock()
 
   async def _resolve_runner(self) -> Runner:
-    """Resolve the runner, handling cases where it's a callable that returns a Runner."""
+    """Resolve the runner.
+
+    Handles cases where it's a callable returning a Runner.
+    """
     # If already resolved and cached, return it
     if isinstance(self._runner, Runner):
       return self._runner
@@ -114,9 +122,68 @@ class A2aAgentExecutor(AgentExecutor):
 
   @override
   async def cancel(self, context: RequestContext, event_queue: EventQueue):
-    """Cancel the execution."""
-    # TODO: Implement proper cancellation logic if needed
-    raise NotImplementedError('Cancellation is not supported')
+    """Cancel the execution of a running task.
+
+    Args:
+      context: The request context containing the task_id to cancel.
+      event_queue: The event queue to publish cancellation events to.
+
+    If the task is found and running, it will be cancelled and a cancellation
+    event will be published. If the task is not found or already completed,
+    the method will log a warning and return gracefully.
+    """
+    if not context.task_id:
+      logger.warning('Cannot cancel task: no task_id provided in context')
+      return
+
+    # Use lock to prevent race conditions with _handle_request cleanup
+    async with self._tasks_lock:
+      task = self._active_tasks.get(context.task_id)
+      if not task:
+        logger.warning(
+            'Task %s not found or already completed', context.task_id
+        )
+        return
+
+      if task.done():
+        # Task already completed, clean up
+        self._active_tasks.pop(context.task_id, None)
+        logger.info('Task %s already completed', context.task_id)
+        return
+
+      # Remove from tracking before cancelling to prevent double cleanup
+      self._active_tasks.pop(context.task_id, None)
+
+    # Cancel the task (outside lock to avoid blocking other operations)
+    logger.info('Cancelling task %s', context.task_id)
+    task.cancel()
+    try:
+      # Wait for cancellation to complete with timeout
+      await asyncio.wait_for(task, timeout=1.0)
+    except (asyncio.CancelledError, asyncio.TimeoutError):
+      # Expected when task is cancelled or timeout occurs
+      pass
+
+    # Publish cancellation event
+    try:
+      await event_queue.enqueue_event(
+          TaskStatusUpdateEvent(
+              task_id=context.task_id,
+              status=TaskStatus(
+                  state=TaskState.failed,
+                  timestamp=datetime.now(timezone.utc).isoformat(),
+                  message=Message(
+                      message_id=str(uuid.uuid4()),
+                      role=Role.agent,
+                      parts=[TextPart(text='Task was cancelled')],
+                  ),
+              ),
+              context_id=context.context_id,
+              final=True,
+          )
+      )
+    except Exception as e:
+      logger.error('Failed to publish cancellation event: %s', e, exc_info=True)
 
   @override
   async def execute(
@@ -221,17 +288,43 @@ class A2aAgentExecutor(AgentExecutor):
     )
 
     task_result_aggregator = TaskResultAggregator()
-    async with Aclosing(runner.run_async(**vars(run_request))) as agen:
-      async for adk_event in agen:
-        for a2a_event in self._config.event_converter(
-            adk_event,
-            invocation_context,
-            context.task_id,
-            context.context_id,
-            self._config.gen_ai_part_converter,
-        ):
-          task_result_aggregator.process_event(a2a_event)
-          await event_queue.enqueue_event(a2a_event)
+
+    # Helper function to iterate over async generator
+    async def _process_events():
+      async with Aclosing(runner.run_async(**vars(run_request))) as agen:
+        async for adk_event in agen:
+          for a2a_event in self._config.event_converter(
+              adk_event,
+              invocation_context,
+              context.task_id,
+              context.context_id,
+              self._config.gen_ai_part_converter,
+          ):
+            task_result_aggregator.process_event(a2a_event)
+            await event_queue.enqueue_event(a2a_event)
+
+    # Create and track the task for cancellation support
+    if context.task_id:
+      task = asyncio.create_task(_process_events())
+      # Use lock to prevent race conditions with cancel()
+      async with self._tasks_lock:
+        self._active_tasks[context.task_id] = task
+      try:
+        await task
+      except asyncio.CancelledError:
+        # Task was cancelled
+        # Note: cancellation event is published by cancel() method,
+        # so we just log and handle gracefully here
+        logger.info('Task %s was cancelled', context.task_id)
+        # Return early - don't publish completion events for cancelled tasks
+        return
+      finally:
+        # Clean up task tracking (use lock to prevent race conditions)
+        async with self._tasks_lock:
+          self._active_tasks.pop(context.task_id, None)
+    else:
+      # No task_id, run without tracking
+      await _process_events()
 
     # publish the task result event - this is final
     if (

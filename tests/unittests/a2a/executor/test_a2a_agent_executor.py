@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 from unittest.mock import AsyncMock
 from unittest.mock import Mock
 from unittest.mock import patch
@@ -20,6 +21,7 @@ from a2a.server.agent_execution.context import RequestContext
 from a2a.server.events.event_queue import EventQueue
 from a2a.types import Message
 from a2a.types import TaskState
+from a2a.types import TaskStatusUpdateEvent
 from a2a.types import TextPart
 from google.adk.a2a.converters.request_converter import AgentRunRequest
 from google.adk.a2a.executor.a2a_agent_executor import A2aAgentExecutor
@@ -583,22 +585,138 @@ class TestA2aAgentExecutor:
     """Test cancellation with a task ID."""
     self.mock_context.task_id = "test-task-id"
 
-    # The current implementation raises NotImplementedError
-    with pytest.raises(
-        NotImplementedError, match="Cancellation is not supported"
-    ):
-      await self.executor.cancel(self.mock_context, self.mock_event_queue)
+    # Cancel should succeed without raising
+    await self.executor.cancel(self.mock_context, self.mock_event_queue)
+
+    # If no task is running, should log warning but not raise
+    # Verify event queue was not called (no task to cancel)
+    assert self.mock_event_queue.enqueue_event.call_count == 0
 
   @pytest.mark.asyncio
   async def test_cancel_without_task_id(self):
     """Test cancellation without a task ID."""
     self.mock_context.task_id = None
 
-    # The current implementation raises NotImplementedError regardless of task_id
-    with pytest.raises(
-        NotImplementedError, match="Cancellation is not supported"
-    ):
-      await self.executor.cancel(self.mock_context, self.mock_event_queue)
+    # Cancel should handle missing task_id gracefully
+    await self.executor.cancel(self.mock_context, self.mock_event_queue)
+
+    # Should not publish any events when task_id is missing
+    assert self.mock_event_queue.enqueue_event.call_count == 0
+
+  @pytest.mark.asyncio
+  async def test_cancel_running_task(self):
+    """Test cancellation of a running task."""
+    self.mock_context.task_id = "test-task-id"
+
+    # Setup: Create a running task by starting execution
+    self.mock_request_converter.return_value = AgentRunRequest(
+        user_id="test-user",
+        session_id="test-session",
+        new_message=Mock(spec=Content),
+        run_config=Mock(spec=RunConfig),
+    )
+    mock_session = Mock()
+    mock_session.id = "test-session"
+    self.mock_runner.session_service.get_session = AsyncMock(
+        return_value=mock_session
+    )
+    mock_invocation_context = Mock()
+    self.mock_runner._new_invocation_context.return_value = (
+        mock_invocation_context
+    )
+
+    # Create an async generator that yields events slowly
+    async def slow_generator():
+      mock_event = Mock(spec=Event)
+      yield mock_event
+      # This will hang if not cancelled
+      await asyncio.sleep(10)
+
+    # Replace run_async with the async generator function
+    self.mock_runner.run_async = slow_generator
+    self.mock_event_converter.return_value = []
+
+    # Start execution in background
+    execute_task = asyncio.create_task(
+        self.executor.execute(self.mock_context, self.mock_event_queue)
+    )
+
+    # Wait a bit to ensure task is running
+    await asyncio.sleep(0.1)
+
+    # Cancel the task
+    await self.executor.cancel(self.mock_context, self.mock_event_queue)
+
+    # Wait for cancellation to complete
+    try:
+      await asyncio.wait_for(execute_task, timeout=2.0)
+    except asyncio.CancelledError:
+      pass
+
+    # Verify cancellation event was published
+    assert self.mock_event_queue.enqueue_event.call_count > 0
+    # Find the cancellation event (should be the last one with failed state)
+    cancellation_events = [
+        call[0][0]
+        for call in self.mock_event_queue.enqueue_event.call_args_list
+        if isinstance(call[0][0], TaskStatusUpdateEvent)
+        and call[0][0].status.state == TaskState.failed
+        and call[0][0].final is True
+    ]
+    assert len(cancellation_events) > 0, "No cancellation event found"
+    cancellation_event = cancellation_events[-1]
+    assert cancellation_event.status.state == TaskState.failed
+    assert cancellation_event.final is True
+
+  @pytest.mark.asyncio
+  async def test_cancel_nonexistent_task(self):
+    """Test cancellation of a non-existent task."""
+    self.mock_context.task_id = "nonexistent-task-id"
+
+    # Cancel should handle gracefully
+    await self.executor.cancel(self.mock_context, self.mock_event_queue)
+
+    # Should not publish any events for non-existent task
+    assert self.mock_event_queue.enqueue_event.call_count == 0
+
+  @pytest.mark.asyncio
+  async def test_cancel_completed_task(self):
+    """Test cancellation of an already completed task."""
+    self.mock_context.task_id = "test-task-id"
+
+    # Setup and run a task to completion
+    self.mock_request_converter.return_value = AgentRunRequest(
+        user_id="test-user",
+        session_id="test-session",
+        new_message=Mock(spec=Content),
+        run_config=Mock(spec=RunConfig),
+    )
+    mock_session = Mock()
+    mock_session.id = "test-session"
+    self.mock_runner.session_service.get_session = AsyncMock(
+        return_value=mock_session
+    )
+    mock_invocation_context = Mock()
+    self.mock_runner._new_invocation_context.return_value = (
+        mock_invocation_context
+    )
+
+    # Create a generator that completes immediately
+    async def quick_generator():
+      mock_event = Mock(spec=Event)
+      yield mock_event
+
+    self.mock_runner.run_async.return_value = quick_generator()
+    self.mock_event_converter.return_value = []
+
+    # Run to completion
+    await self.executor.execute(self.mock_context, self.mock_event_queue)
+
+    # Now try to cancel (should handle gracefully)
+    await self.executor.cancel(self.mock_context, self.mock_event_queue)
+
+    # Should not publish additional cancellation event for completed task
+    # (The execute already published final event)
 
   @pytest.mark.asyncio
   async def test_execute_with_exception_handling(self):
