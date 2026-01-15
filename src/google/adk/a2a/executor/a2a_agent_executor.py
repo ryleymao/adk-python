@@ -158,7 +158,9 @@ class A2aAgentExecutor(AgentExecutor):
     logger.info('Cancelling task %s', context.task_id)
     if not task.cancel():
       # Task completed before it could be cancelled
-      logger.info('Task %s completed before it could be cancelled', context.task_id)
+      logger.info(
+          'Task %s completed before it could be cancelled', context.task_id
+      )
       return
 
     try:
