@@ -719,6 +719,44 @@ class TestA2aAgentExecutor:
     # (The execute already published final event)
 
   @pytest.mark.asyncio
+  async def test_cancel_race_condition_task_completes_before_cancel(self):
+    """Test race condition where task completes before cancel() is called."""
+    self.mock_context.task_id = "test-task-id"
+
+    # Create a mock task that is already done
+    mock_task = Mock(spec=asyncio.Task)
+    mock_task.done.return_value = False  # Initially not done (passes check)
+    mock_task.cancel.return_value = (
+        False  # Returns False because task completed between check and cancel
+    )
+
+    # Manually add task to _active_tasks to simulate race condition
+    self.executor._active_tasks["test-task-id"] = mock_task
+
+    # Call cancel
+    await self.executor.cancel(self.mock_context, self.mock_event_queue)
+
+    # Verify task.cancel() was called
+    mock_task.cancel.assert_called_once()
+
+    # Verify no cancellation event was published (since cancel() returned False)
+    # Check that no TaskStatusUpdateEvent with "Task was cancelled" was published
+    cancellation_events = [
+        call[0][0]
+        for call in self.mock_event_queue.enqueue_event.call_args_list
+        if isinstance(call[0][0], TaskStatusUpdateEvent)
+        and call[0][0].status.state == TaskState.failed
+        and any(
+            part.text == "Task was cancelled"
+            for part in call[0][0].status.message.parts
+            if hasattr(part, "text")
+        )
+    ]
+    assert (
+        len(cancellation_events) == 0
+    ), "Should not publish cancellation event when task completed before cancel"
+
+  @pytest.mark.asyncio
   async def test_execute_with_exception_handling(self):
     """Test execution with exception handling."""
     self.mock_context.task_id = "test-task-id"

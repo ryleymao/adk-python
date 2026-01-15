@@ -156,7 +156,11 @@ class A2aAgentExecutor(AgentExecutor):
 
     # Cancel the task (outside lock to avoid blocking other operations)
     logger.info('Cancelling task %s', context.task_id)
-    task.cancel()
+    if not task.cancel():
+      # Task completed before it could be cancelled
+      logger.info('Task %s completed before it could be cancelled', context.task_id)
+      return
+
     try:
       # Wait for cancellation to complete with timeout
       await asyncio.wait_for(task, timeout=1.0)
