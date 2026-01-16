@@ -138,21 +138,17 @@ class A2aAgentExecutor(AgentExecutor):
 
     # Use lock to prevent race conditions with _handle_request cleanup
     async with self._tasks_lock:
-      task = self._active_tasks.get(context.task_id)
-      if not task:
-        logger.warning(
-            'Task %s not found or already completed', context.task_id
-        )
-        return
+      task = self._active_tasks.pop(context.task_id, None)
 
-      if task.done():
-        # Task already completed, clean up
-        self._active_tasks.pop(context.task_id, None)
-        logger.info('Task %s already completed', context.task_id)
-        return
+    if not task:
+      logger.warning(
+          'Task %s not found or already completed', context.task_id
+      )
+      return
 
-      # Remove from tracking before cancelling to prevent double cleanup
-      self._active_tasks.pop(context.task_id, None)
+    if task.done():
+      logger.info('Task %s already completed', context.task_id)
+      return
 
     # Cancel the task (outside lock to avoid blocking other operations)
     logger.info('Cancelling task %s', context.task_id)
